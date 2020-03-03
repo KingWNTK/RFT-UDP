@@ -23,7 +23,7 @@ struct send_packet {
 #define BATCH_SIZE 1024 * 512
 struct file_holder {
     char data[BATCH_SIZE];
-    int offset_sent;
+    int buffer_sent;
     int buffer_size;
     int tot_bytes_sent;
     int tot_bytes;
@@ -50,20 +50,20 @@ bool refill_file_data() {
     }
     file.buffer_size = min(BATCH_SIZE, file.tot_bytes - file.tot_bytes_sent);
     //read min(BATCH_SIZE, tot_bytes - tot_bytes-snet) bytes starting from tot_bytes_sent from the fd
-    file.offset_sent = 0;
+    file.buffer_sent = 0;
     return true;
 }
 
 bool get_file_data(win_entry *info) {
-    if (file.offset_sent == file.buffer_size) {
+    if (file.buffer_sent == file.buffer_size) {
         if (!refill_file_data())
             return false;
     }
-    info->dsize = min(info->dsize, file.buffer_size - file.offset_sent);
+    info->dsize = min(info->dsize, file.buffer_size - file.buffer_sent);
     info->data = malloc(info->dsize);
-    memcpy(info->data, file.data + file.offset_sent, info->dsize);
+    memcpy(info->data, file.data + file.buffer_sent, info->dsize);
     file.tot_bytes_sent += info->dsize;
-    file.offset_sent += info->dsize;
+    file.buffer_sent += info->dsize;
     return true;
 }
 
@@ -149,7 +149,8 @@ void try_send() {
 
 void clock() {
     while (1) {
-        sleep("1ms");
+        //sleep for 100 microseconds, can be modified
+        usleep(100);
         pthread_mutex_lock(&mutex);
         update_retrans_cd();
         pthread_mutex_unlock(&mutex);
