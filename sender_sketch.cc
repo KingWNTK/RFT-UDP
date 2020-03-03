@@ -85,7 +85,7 @@ bool recv_data(char *buf) {
             if (packet->ack == 1) {
                 //if the filename and directory is received, init the window to send file data
                 window.clear();
-                for (int i = 1; i <= min(WIN_SIZE, file_offset_max); i++) {
+                for (int i = 1; i <= window_size; i++) {
                     window.push_back(win_entry{(last_seq_num + i) % SEQ_MAX, 0, 0, NULL, packet_dsize_max});
                 }
             }
@@ -94,12 +94,9 @@ bool recv_data(char *buf) {
             for (int i = 0; i < sz; i++) {
                 window.pop_front();
             }
-            for (int i = 0; i < sz; i++) {
-                if (window.back()->offset < file_offset_max) {
-                    window.push_back(win_entry{(last_seq_num + 1) % SEQ_MAX, 0, 0, NULL, packet_dsize_max});
-                } else {
-                    break;
-                }
+
+            while (window.size() < window_size) {
+                window.push_back(win_entry{(last_seq_num + 1) % SEQ_MAX, 0, 0, NULL, packet_dsize_max});
             }
         }
     }
