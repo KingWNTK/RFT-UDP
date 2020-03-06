@@ -128,6 +128,7 @@ bool recv_data(int len) {
 
 
     auto header = (packet_header *) buffer;
+    to_host_format(header);
 
     auto first = window.front();
     auto last = window.back();
