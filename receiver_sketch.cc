@@ -22,13 +22,11 @@ struct win_entry {
     char *data;
     int dsize;
     int control;
-    win_entry(int seq_num_in, char *data_in, int dsize_in, int control_in) : seq_num(seq_num_in), data(data_in), dsize(dsize_in), control(control_in) {
-    }
+    win_entry(int seq_num_in) : seq_num(seq_num_in), data(nullptr), dsize(0) {}
     bool is_empty() {
         return (!data);
     }
-    set_data(char *data_in, int dsize_in) {
-        dsize = dsize_in;
+    set_data(char *data_in, int dsize_in, int control_in) : control(control_in), dsize(dsize_in) {
         data = (char *)malloc(dsize);
         memcpy(data, data_in, dsize);
     }
@@ -38,6 +36,50 @@ struct win_entry {
         }
     }
 };
+
+
+#define BATCH_SIZE 1024 * 512
+struct file_holder {
+    char buf[BATCH_SIZE];
+    int buffer_size;
+    int tot_bytes_saved;
+    string subdir;
+    string filename;
+    int fd;
+    ~file_holder() {
+        close(fd);
+    }
+};
+
+file_holder file;
+
+bool init_file_holder(string path) {
+    file.fd = open(path.c_str(), O_RDONLY | O_FSYNC | O_CREAT);
+    if (file.fd == -1) {
+        return false;
+    }
+    file.buffer_size = file.tot_bytes_saved = 0;
+    memset(file.buf, 0, sizeof(file.buf));
+    return true;
+}
+
+void save_file_data() {
+    lseek(file.fd, 0, SEEK_END);
+    write(file.fd, file.buf, file.buffer_size);
+    file.tot_bytes_saved += file.buffer_size;
+    file.buffer_size = 0;
+}
+
+bool write_file_data(win_entry *info) {
+    if(info->is_empty()) return false;
+    if(file.buffer_size + info->dsize > BATCH_SIZE) {
+        save_file_data();
+    }
+    memcpy(file.buf + file.buffer_size, info->data, info->dsize);
+    file.buffer_size += info->dsize;
+    return true;
+}
+
 
 #define SEQ_MAX 128
 deque<win_entry> window;
@@ -51,6 +93,18 @@ string file_path;
 int sock;
 
 struct sockaddr_in sin;
+
+bool send_data(int ack, int control) {
+    auto header = (packet_header *) buffer;
+    header->seq_num = ack;
+    header->length = sizeof(header);
+    header->control = control;
+    header->checksum = 0;
+    header->checksum = gen_checksum(header, header->length);
+    to_network_format(header);
+
+    sendto(sock, buffer, info->dsize + sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *) &sin, sizeof(sin));
+}
 
 bool recv_data(int len) {
     if(!sanity_check(buffer, len)) return false;
@@ -66,14 +120,37 @@ bool recv_data(int len) {
             if((*iter).seq_num == header->seq_num) {
                 //save the data if we hasn't received this packet before
                 if((*iter).is_empty()) {
-                    (*iter).set_data(buffer + sizeof(header), header->length - sizeof(header));
+                    (*iter).set_data(buffer + sizeof(header), header->length - sizeof(header), header->control);
                 }
                 break;
             }
         }
     }
     if(!window.front().is_empty()) {
-        //TODO we can now move the sliding window.
+        //we can now move the sliding window.
+        int sz = 0;
+        int ack;
+        int control;
+        while(!window.empty() && !window.front().is_empty()) {
+            sz++;
+            if(window.front().control & CONTROL_META_DATA) {
+                auto front = window.front();
+                if(front.seq_num == 0) {
+                    file.subdir = string(front.data, front.dsize);
+                }
+                else {
+                    file.filename = string(front.data, front.dsize);
+                }
+            }
+            ack = window.front().seq_num;
+            control = window.front().control;
+            window.pop_front();
+        }
+        while(sz--) {
+            window.push_back(win_entry((last.seq_num + 1) % SEQ_MAX));
+        }
+        //send the ack to the sever
+        send_data(ack, control);
     }
     return false;
 }
