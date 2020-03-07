@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <string>
 #include <iostream>
+#include <memory>
 
 #include "protocol.h"
 
@@ -40,6 +41,8 @@ struct win_entry {
     }
 };
 
+typedef shared_ptr<win_entry> win_entry_ptr;
+
 #define BATCH_SIZE 1024 * 512
 
 struct file_holder {
@@ -58,7 +61,7 @@ struct file_holder {
 file_holder file;
 
 #define SEQ_MAX 128
-deque<win_entry> window;
+deque<win_entry_ptr> window;
 int window_size = 32;
 
 int retrans_cd_max = 10;
@@ -73,6 +76,10 @@ pthread_mutex_t mutex;
 int sock;
 
 struct sockaddr_in sin;
+
+socklen_t sin_len;
+
+bool done = false;
 
 
 bool init_file_holder(string path) {
@@ -104,7 +111,10 @@ bool refill_file_buf() {
     return true;
 }
 
-bool get_file_data(win_entry *info) {
+bool get_file_data(win_entry_ptr info) {
+    cout << "trying to get file data" << endl;
+
+    cout << file.buffer_sent << ' ' << file.buffer_size << endl;
     if (file.buffer_sent == file.buffer_size) {
         if (!refill_file_buf())
             return false;
@@ -116,53 +126,53 @@ bool get_file_data(win_entry *info) {
     file.tot_bytes_sent += info->dsize;
     file.buffer_sent += info->dsize;
     pthread_mutex_unlock(&mutex);
+    cout << "get file data done" << endl;
+ 
     return true;
 }
 
 bool recv_data(int len) {
-    if (window.empty())
-        return true;
+    cout << "data received: " << len << " bytes" << endl;
 
     if (!sanity_check(buffer, len))
         return false;
 
-
     auto header = (packet_header *) buffer;
-    to_host_format(header);
 
-    auto first = window.front();
-    auto last = window.back();
-
-    if (header->seq_num >= first.seq_num && header->seq_num <= last.seq_num) {
-        int sz = (header->seq_num - first.seq_num + 1 + SEQ_MAX) % SEQ_MAX;
-        int last_seq_num = last.seq_num;
+    if (header->seq_num >= window.front()->seq_num && header->seq_num <= window.back()->seq_num) {
+        int sz = (header->seq_num - window.front()->seq_num + 1 + SEQ_MAX) % SEQ_MAX;
+        int last_seq_num = window.back()->seq_num;
         if (header->control & CONTROL_META_DATA) {
             if (header->seq_num == 1) {
                 //if the filename and directory is received, init the window to send file buf
-                window.clear();
+                window = deque<win_entry_ptr>{};
                 for (int i = 1; i <= window_size; i++) {
-                    window.push_back(win_entry((last_seq_num + i) % SEQ_MAX, nullptr, packet_dsize_max, 0));
+                    window.emplace_back(make_shared<win_entry>((last_seq_num + i) % SEQ_MAX, nullptr, packet_dsize_max, 0));
                 }
+
             }
         } else {
             //sz packets are received, try to fill the window with sz more packets
             for (int i = 0; i < sz; i++) {
-                file.tot_bytes_sent += window.front().dsize;
                 window.pop_front();
             }
 
             while (window.size() < window_size) {
-                window.push_back(win_entry((last_seq_num + 1) % SEQ_MAX, nullptr, packet_dsize_max, 0));
+                window.emplace_back(make_shared<win_entry>((last_seq_num + 1) % SEQ_MAX, nullptr, packet_dsize_max, 0));
             }
         }
     }
 
-    if (window.empty())
-        return true;
-    return false;
+    // if(header->seq_num == 18) {
+    //     done = true;
+    // }
+
+    return true;
 }
 
-bool send_data(win_entry *info) {
+bool send_data(win_entry_ptr info) {
+    cout << "trying to send data" << endl;
+
     /** 
      * fill the buffer
      */
@@ -172,17 +182,21 @@ bool send_data(win_entry *info) {
             return false;
         }
     }
+    cout << info->dsize << endl;
     auto header = (packet_header *) buffer;
-//    cout << "sending data, seq num: " << info->seq_num << ", times sent: " << info->times_sent << endl;
     header->seq_num = info->seq_num;
     header->control = info->control;
     header->checksum = 0;
     header->length = sizeof(packet_header) + info->dsize;
     memcpy(buffer + sizeof(packet_header), info->data, info->dsize);
+    cout << "ready" << endl;
     header->checksum = gen_checksum(buffer, header->length);
+
     to_network_format(header);
 
     sendto(sock, buffer, info->dsize + sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *) &sin, sizeof(sin));
+
+    cout << "data sent, seq num: " << info->seq_num << ", times sent: " << info->times_sent << endl;
 
     pthread_mutex_lock(&mutex);
     info->retrans_cd = retrans_cd_max;
@@ -192,37 +206,38 @@ bool send_data(win_entry *info) {
 }
 
 void update_retrans_cd() {
-    for (auto iter = window.begin(); iter != window.end();  iter++) {
-        (*iter).retrans_cd--;
+    for (auto e : window) {
+        e->retrans_cd--;
     }
 }
 
 void try_receive() {
     int num_recv = 0;
-    socklen_t len;
-    if ((num_recv = recvfrom(sock, buffer, BUFFER_SIZE, MSG_DONTWAIT, (struct sockaddr *) &sin, &len)) > 0) {
+    if ((num_recv = recvfrom(sock, buffer, BUFFER_SIZE, MSG_DONTWAIT, (struct sockaddr *) &sin, &sin_len)) > 0) {
+        cout << "received" << endl;
         pthread_mutex_lock(&mutex);
         if(recv_data(num_recv)) {
-            //everything is received by the client
-            //TODO try to terminate the sender safely
+            
         }
-        pthread_mutex_lock(&mutex);
+        pthread_mutex_unlock(&mutex);
     }
 }
 
 void try_send() {
-    for (auto iter = window.begin(); iter != window.end();  iter++) {
-        if ((*iter).retrans_cd <= 0) {
-            send_data(&(*iter));
+    for (auto e : window) {
+        if (e->retrans_cd <= 0) {
+            if(!send_data(e)) {
+                // done = true;
+            }
             break;
         }
     }
 }
 
 void *my_clock(void *arg) {
-    while (1) {
+    while (1 && !done) {
         //sleep for 100 microseconds, can be modified
-        usleep(100000);
+        usleep(100);
         pthread_mutex_lock(&mutex);
         update_retrans_cd();
         pthread_mutex_unlock(&mutex);
@@ -232,10 +247,11 @@ void *my_clock(void *arg) {
 
 void *my_send(void *arg) {
              //path
-    window = {win_entry(0, ((string *)arg)[0].c_str(), CONTROL_META_DATA),
+    window = {make_shared<win_entry>(0, ((string *)arg)[0].c_str(), CONTROL_META_DATA),
               //filename
-              win_entry(1, ((string *) arg)[1].c_str(), CONTROL_META_DATA)};
-    while (1) {
+              make_shared<win_entry>(1, ((string *) arg)[1].c_str(), CONTROL_META_DATA)};
+
+    while (1 && !done) {
         try_receive();
         try_send();
     }
@@ -279,7 +295,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "failed to open file");
         return -1;
     }
-
     refill_file_buf();
 
     /* variables for identifying the receiver */
@@ -298,7 +313,7 @@ int main(int argc, char **argv) {
     }
     /* create a socket */
     if ((sock = socket(PF_INET, SOCK_DGRAM, 0)) < 0) {
-        fprintf(stderr, "opening TCP socket error");
+        fprintf(stderr, "opening UDP socket error");
         return -1;
     }
 
@@ -307,7 +322,6 @@ int main(int argc, char **argv) {
     sin.sin_addr.s_addr = receiver_addr;
     unsigned short server_port = atoi(recv_port.c_str());
     sin.sin_port = htons(server_port);
-
 
 
     if (pthread_mutex_init(&mutex, nullptr) != 0) {
