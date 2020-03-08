@@ -43,7 +43,7 @@ struct win_entry {
 
 typedef shared_ptr<win_entry> win_entry_ptr;
 
-int last_ack;
+int last_ack = -1;
 int last_control;
 
 #define BATCH_SIZE 1024 * 512
@@ -92,7 +92,7 @@ file_holder file;
 deque<win_entry_ptr> window;
 int window_size = 32;
 
-#define BUFFER_SIZE 1024 * 512
+#define BUFFER_SIZE PACKET_SIZE_MAX
 char buffer[BUFFER_SIZE];
 
 int sock;
@@ -101,6 +101,8 @@ struct sockaddr_in sin, sender_addr;
 
 socklen_t sender_addr_len;
 
+bool has_started = false;
+
 bool should_close = false;
 
 int fin_cd = 0;
@@ -108,10 +110,6 @@ int fin_cd = 0;
 int fine_times_tried = 0;
 
 pthread_mutex_t mutex;
-
-inline int dis(int a, int b) {
-    return (b - a + SEQ_MAX) % SEQ_MAX;
-}
 
 bool send_data(unsigned int ack, unsigned int control) {
     auto header = (packet_header *)buffer;
@@ -122,7 +120,7 @@ bool send_data(unsigned int ack, unsigned int control) {
     header->checksum = gen_checksum(header, header->length);
     to_network_format(header);
 
-    sendto(sock, buffer, sizeof(packet_header), 0, (struct sockaddr *)&sender_addr, sender_addr_len);
+    sendto(sock, buffer, sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *)&sender_addr, sender_addr_len);
     cout << "[send data] ack: " << ack << " control: " << control << endl;
 }
 
@@ -136,13 +134,29 @@ int recv_data(int len) {
     cout << "[recv data] (" << header->length << " bytes) control: " << header->control
          << " seq_num: " << header->seq_num << endl;
 
-    cout << window.front()->seq_num << ' ' << window.back()->seq_num << endl;
-
-    if (header->control == CONTROL_FIN) {
+    if ((header->control & CONTROL_FIN) && last_ack == header->seq_num) {
         return CONTROL_FIN;
     }
 
-    if ((window.front()->seq_num <= header->seq_num && dis(window.front()->seq_num, header->seq_num) < window.size()) || (window.back()->seq_num >= header->seq_num && dis(header->seq_num, window.back()->seq_num) < window.size())) {
+
+    if (!has_started && (header->control & CONTROL_FILEPATH)) {
+        cout << "enter init section" << endl;
+        string filepath = string(buffer + sizeof(packet_header), header->length - sizeof(packet_header));
+        int p = filepath.find('/');
+        file.subdir = filepath.substr(0, p);
+        file.filename = filepath.substr(p + 1, filepath.length() - p);
+        file.init_file_holder();
+
+        last_ack = header->seq_num;
+        last_control = header->control;
+
+        window = deque<win_entry_ptr>{};
+        //init the receive window
+        for (int i = 1; i <= window_size; i++) {
+            window.emplace_back(make_shared<win_entry>((last_ack + i) % SEQ_MAX));
+        }
+        has_started = true;
+    } else if (!window.empty() && is_seq_in_window(header->seq_num, window.front()->seq_num, window.back()->seq_num, window.size())) {
         for (auto e : window) {
             if (e->seq_num == header->seq_num) {
                 //save the data if we hasn't received this packet before
@@ -152,33 +166,24 @@ int recv_data(int len) {
                 break;
             }
         }
-    }
-    if (!window.front()->is_empty()) {
-        //we can now move the sliding window.
-        int sz = 0;
-        int base = window.back()->seq_num;
-        while (!window.empty() && !window.front()->is_empty()) {
-            sz++;
-            if (window.front()->control & CONTROL_META_DATA) {
-                if (window.front()->seq_num == 0) {
-                    file.subdir = string(window.front()->data, window.front()->dsize);
-                } else {
-                    file.filename = string(window.front()->data, window.front()->dsize);
-                    file.init_file_holder();
-                }
-            } else {
+        if (!window.front()->is_empty()) {
+            //we can now move the sliding window.
+            int sz = 0;
+            int base = window.back()->seq_num;
+            while (!window.empty() && !window.front()->is_empty()) {
+                sz++;
                 file.write_file_data(window.front());
+                last_ack = window.front()->seq_num;
+                last_control = window.front()->control;
+                window.pop_front();
             }
-            last_ack = window.front()->seq_num;
-            last_control = window.front()->control;
-            window.pop_front();
+            for (int i = 1; i <= sz; i++) {
+                window.emplace_back(make_shared<win_entry>((base + i) % SEQ_MAX));
+            }
         }
-        for (int i = 1; i <= sz; i++) {
-            window.push_back(make_shared<win_entry>((base + i) % SEQ_MAX));
-        }
-        //send the ack to the sever
     }
-    send_data(last_ack, last_control);
+    if (has_started)
+        send_data(last_ack, last_control);
 
     return 0;
 }
@@ -198,25 +203,28 @@ int try_recv_fin() {
     if (num_recv <= 0 || !sanity_check(buffer, num_recv))
         return 0;
     auto header = (packet_header *)buffer;
-    cout << "[recv fin] " << header->control << endl;
+    if (header->seq_num != last_ack)
+        return 0;
 
+    cout << "[recv fin] " << header->control << ' ' << header->seq_num << endl;
+
+    if (header->control & CONTROL_FIN)
+        return CONTROL_FIN;
     if (header->control & CONTROL_FIN_ACK)
         return CONTROL_FIN_ACK;
-    else if (header->control & CONTROL_FIN)
-        return CONTROL_FIN;
     return 0;
 }
 
-void try_send_fin(unsigned int control) {
+void try_send_fin(unsigned int control, unsigned int seq_num) {
     auto header = (packet_header *)buffer;
     header->control = control;
     header->length = sizeof(packet_header);
     header->checksum = 0;
-    header->seq_num = 0;
+    header->seq_num = seq_num;
     header->checksum = gen_checksum(buffer, header->length);
     to_network_format(header);
     sendto(sock, buffer, sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *)&sender_addr, sizeof(sender_addr));
-    cout << "[send fin] " << header->control << endl;
+    cout << "[send fin] " << header->control << ' ' << seq_num << endl;
 }
 
 void *my_clock(void *arg) {
@@ -233,7 +241,7 @@ void *my_fin(void *arg) {
     while (1) {
         pthread_mutex_lock(&mutex);
         if (fin_cd <= 0) {
-            try_send_fin(CONTROL_FIN);
+            try_send_fin(CONTROL_FIN, last_ack);
             fin_cd = FIN_RETRANS_CD;
             fine_times_tried++;
         }
@@ -286,22 +294,11 @@ int main(int argc, char **argv) {
     sin.sin_addr.s_addr = htonl(INADDR_ANY);
     sin.sin_port = htons(receiver_port);
 
-    cout << receiver_port << endl;
     /* bind socket to the address */
     if (bind(sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
         fprintf(stderr, "binding socket to address");
         return -1;
     }
-
-    //init the receive window
-    for (int i = 0; i < window_size; i++) {
-        window.emplace_back(make_shared<win_entry>(i));
-    }
-
-    last_ack = SEQ_MAX - 1;
-    last_control = 0;
-
-    while(recvfrom(sock, buffer, BUFFER_SIZE, MSG_DONTWAIT, (struct sockaddr *)&sender_addr, &sender_addr_len) > 0);
 
     while (1) {
         if (try_receive()) {

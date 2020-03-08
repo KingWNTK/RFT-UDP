@@ -13,6 +13,8 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <ctime>
+#include <cstdlib>
 
 #include "protocol.h"
 
@@ -105,9 +107,10 @@ int window_size = 32;
 
 int retrans_cd_max = 10;
 
-int packet_dsize_max = 1024 * 32;
+int last_seq_num = 0;
 
-#define BUFFER_SIZE 1024 * 512
+
+#define BUFFER_SIZE PACKET_SIZE_MAX
 char buffer[BUFFER_SIZE];
 
 pthread_mutex_t mutex;
@@ -122,10 +125,6 @@ bool should_close = false;
 
 int fin_cd = 0;
 
-inline int dis(int a, int b) {
-    return (b - a + SEQ_MAX) % SEQ_MAX;
-}
-
 bool recv_data(int len) {
     if (!sanity_check(buffer, len)) {
         cout << "[recv corrupt packet]" << endl;
@@ -139,30 +138,20 @@ bool recv_data(int len) {
     auto header = (packet_header *)buffer;
     cout << "[recv data] (" << header->length << " bytes) control: " << header->control
          << " seq_num: " << header->seq_num << endl;
-    // int sz = 0;
-    // bool ok = false;
-    // for(auto e : window) {
-    //     sz++;
-    //     if(e->seq_num == header->seq_num) {
-    //         ok = true;
-    //         break;
-    //     }
-    // }
-    if ((window.front()->seq_num <= header->seq_num && dis(window.front()->seq_num, header->seq_num) < window.size()) || (window.back()->seq_num >= header->seq_num && dis(header->seq_num, window.back()->seq_num) < window.size())) {
+    if (is_seq_in_window(header->seq_num, window.front()->seq_num, window.back()->seq_num, window.size())) {
+    // if(((window.front()->seq_num <= header->seq_num && dis(window.front()->seq_num, header->seq_num) < window.size()) || (window.back()->seq_num >= header->seq_num && dis(header->seq_num, window.back()->seq_num) < window.size()))) {
         int sz = window.front()->seq_num <= header->seq_num ? dis(window.front()->seq_num, header->seq_num) + 1 : window.size() - dis(header->seq_num, window.back()->seq_num);
-    // if(ok) {   
-        int last_seq_num = window.back()->seq_num;
-        if (header->control & CONTROL_META_DATA) {
-            if (header->seq_num == 1) {
-                //if the filename and directory is received, init the window to send file buf
-                window = deque<win_entry_ptr>{};
-                for (int i = 1; i <= window_size; i++) {
-                    auto e = make_shared<win_entry>((last_seq_num + i) % SEQ_MAX, nullptr, packet_dsize_max, 0);
-                    if (file.get_file_data(e)) {
-                        window.push_back(e);
-                    } else {
-                        break;
-                    }
+        if (header->control & CONTROL_FILEPATH) {
+            //if the filename and directory is received, init the window
+            window = deque<win_entry_ptr>{};
+            for (int i = 1; i <= window_size; i++) {
+                int nxt_seq = (last_seq_num + 1) % SEQ_MAX;
+                auto e = make_shared<win_entry>(nxt_seq, nullptr, PACKET_DSIZE_MAX, 0);
+                if (file.get_file_data(e)) {
+                    last_seq_num = nxt_seq;
+                    window.emplace_back(e);
+                } else {
+                    break;
                 }
             }
         } else {
@@ -172,10 +161,11 @@ bool recv_data(int len) {
             }
 
             while (window.size() <= window_size) {
-                last_seq_num = (last_seq_num + 1) % SEQ_MAX;
-                auto e = make_shared<win_entry>(last_seq_num, nullptr, packet_dsize_max, 0);
+                int nxt_seq = (last_seq_num + 1) % SEQ_MAX;
+                auto e = make_shared<win_entry>(nxt_seq, nullptr, PACKET_DSIZE_MAX, 0);
                 if (file.get_file_data(e)) {
-                    window.push_back(e);
+                    last_seq_num = nxt_seq;
+                    window.emplace_back(e);
                 } else {
                     break;
                 }
@@ -226,9 +216,9 @@ void try_send() {
     for (auto e : window) {
         if (e->retrans_cd <= 0) {
             send_data(e);
-            if(e->times_sent > 50) {
-                cout << "window size " << window.size() << endl;
-            }
+            // if (e->times_sent > 50) {
+            //     cout << "window size " << window.size() << endl;
+            // }
             break;
         }
     }
@@ -239,24 +229,27 @@ int try_recv_fin() {
     if (num_recv <= 0 || !sanity_check(buffer, num_recv))
         return 0;
     auto header = (packet_header *)buffer;
-    cout << "[recv fin] " << header->control << endl;
+    if (header->seq_num != last_seq_num)
+        return 0;
+    cout << "[recv fin] " << header->control << ' ' << header->seq_num << endl;
+
+    if (header->control & CONTROL_FIN)
+        return CONTROL_FIN;
     if (header->control & CONTROL_FIN_ACK)
         return CONTROL_FIN_ACK;
-    else if (header->control & CONTROL_FIN)
-        return CONTROL_FIN;
     return 0;
 }
 
-void try_send_fin(unsigned int control) {
+void try_send_fin(unsigned int control, unsigned int seq_num) {
     auto header = (packet_header *)buffer;
     header->control = control;
     header->length = sizeof(packet_header);
     header->checksum = 0;
-    header->seq_num = 0;
+    header->seq_num = seq_num;
     header->checksum = gen_checksum(buffer, header->length);
     to_network_format(header);
     sendto(sock, buffer, sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *)&sin, sizeof(sin));
-    cout << "[send fin] " << header->control << endl;
+    cout << "[send fin] " << header->control << ' ' << seq_num << endl;
 }
 
 void *my_clock(void *arg) {
@@ -281,8 +274,9 @@ void *my_clock(void *arg) {
 
 void *my_send(void *arg) {
     //subdir and filename
-    window = {make_shared<win_entry>(0, ((string *)arg)[0].c_str(), CONTROL_META_DATA),
-              make_shared<win_entry>(1, ((string *)arg)[1].c_str(), CONTROL_META_DATA)};
+    srand(time(NULL));
+    last_seq_num = rand() % SEQ_MAX;
+    window = {make_shared<win_entry>(last_seq_num, ((string *)arg)[0].c_str(), CONTROL_FILEPATH)};
     while (1) {
         try_receive();
         try_send();
@@ -294,7 +288,7 @@ void *my_send(void *arg) {
         pthread_mutex_lock(&mutex);
         if (fin_cd <= 0) {
             fin_cd = FIN_RETRANS_CD;
-            try_send_fin(CONTROL_FIN);
+            try_send_fin(CONTROL_FIN, last_seq_num);
         }
         pthread_mutex_unlock(&mutex);
         if (try_recv_fin()) {
@@ -306,7 +300,7 @@ void *my_send(void *arg) {
         pthread_mutex_lock(&mutex);
         if (try_recv_fin()) {
             fin_cd = 10 * FIN_RETRANS_CD;
-            try_send_fin(CONTROL_FIN_ACK);
+            try_send_fin(CONTROL_FIN_ACK, last_seq_num);
         }
         pthread_mutex_unlock(&mutex);
 
@@ -319,7 +313,7 @@ void *my_send(void *arg) {
 }
 
 int main(int argc, char **argv) {
-    string recv_host, recv_port, subdir, filename;
+    string recv_host, recv_port, subdir, filename, filepath;
 
     if (argc < 4) {
         fprintf(stderr, "too few arguments!\n");
@@ -340,6 +334,8 @@ int main(int argc, char **argv) {
             int p = tmp.find('/');
             subdir = tmp.substr(0, p);
             filename = tmp.substr(p + 1, tmp.length() - p);
+            filepath = tmp;
+            
         } else {
             fprintf(stderr, "unknown option!\n");
             return -1;
@@ -349,7 +345,7 @@ int main(int argc, char **argv) {
     /**
      * init the file holder
      */
-    if (!file.init_file_holder(subdir + '/' + filename)) {
+    if (!file.init_file_holder(filepath)) {
         fprintf(stderr, "failed to open file");
         return -1;
     }
@@ -393,9 +389,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "create my_clock failed\n");
         return -1;
     }
-    string send_arg[2];
-    send_arg[0] = subdir;
-    send_arg[1] = filename;
+    string send_arg[1];
+    send_arg[0] = filepath;
 
     error = pthread_create(&my_send_tid, nullptr, &my_send, (void *)send_arg);
     if (error != 0) {
