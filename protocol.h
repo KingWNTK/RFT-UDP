@@ -12,10 +12,10 @@ using namespace std;
 #define FIN_RETRANS_CD 5
 #define CLOCK_TICK_MICROS 100
 
-#define SEQ_MAX 255
+#define SEQ_MAX 1024
 
 struct packet_header {
-    unsigned int seq_num : 8;
+    unsigned int seq_num : 12;
     unsigned int control : 8;
     unsigned int length : 16;
     unsigned int checksum: 16;
