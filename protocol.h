@@ -9,8 +9,11 @@ using namespace std;
 #define CONTROL_FIN 4
 #define CONTROL_FIN_ACK 8
 #define CONTROL_FILEPATH 16
+#define CONTROL_SYNC 32
+#define CONTROL_SYNC_ACK 64
 
-#define FIN_RETRANS_CD 5
+#define SYNC_RETRANS_CD 10
+#define FIN_RETRANS_CD 10
 #define CLOCK_TICK_MICROS 100
 
 #define PACKET_DSIZE_MAX (1024 * 32)

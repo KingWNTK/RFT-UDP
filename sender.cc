@@ -109,7 +109,6 @@ int retrans_cd_max = 10;
 
 int last_seq_num = 0;
 
-
 #define BUFFER_SIZE PACKET_SIZE_MAX
 char buffer[BUFFER_SIZE];
 
@@ -123,7 +122,15 @@ socklen_t sin_len;
 
 bool should_close = false;
 
+bool has_synced = false;
+
 int fin_cd = 0;
+
+int sync_cd = 0;
+
+int dis(int a, int b) {
+    return (b - a + SEQ_MAX) % SEQ_MAX;
+}
 
 bool recv_data(int len) {
     if (!sanity_check(buffer, len)) {
@@ -138,8 +145,9 @@ bool recv_data(int len) {
     auto header = (packet_header *)buffer;
     cout << "[recv data] (" << header->length << " bytes) control: " << header->control
          << " seq_num: " << header->seq_num << endl;
+
     if (is_seq_in_window(header->seq_num, window.front()->seq_num, window.back()->seq_num, window.size())) {
-    // if(((window.front()->seq_num <= header->seq_num && dis(window.front()->seq_num, header->seq_num) < window.size()) || (window.back()->seq_num >= header->seq_num && dis(header->seq_num, window.back()->seq_num) < window.size()))) {
+        // if(((window.front()->seq_num <= header->seq_num && dis(window.front()->seq_num, header->seq_num) < window.size()) || (window.back()->seq_num >= header->seq_num && dis(header->seq_num, window.back()->seq_num) < window.size()))) {
         int sz = window.front()->seq_num <= header->seq_num ? dis(window.front()->seq_num, header->seq_num) + 1 : window.size() - dis(header->seq_num, window.back()->seq_num);
         if (header->control & CONTROL_FILEPATH) {
             //if the filename and directory is received, init the window
@@ -198,6 +206,8 @@ bool send_data(win_entry_ptr info) {
 }
 
 void update_retrans_cd() {
+    if(sync_cd) sync_cd--;
+    if(fin_cd) fin_cd--;
     for (auto e : window) {
         e->retrans_cd--;
     }
@@ -252,21 +262,36 @@ void try_send_fin(unsigned int control, unsigned int seq_num) {
     cout << "[send fin] " << header->control << ' ' << seq_num << endl;
 }
 
+void try_send_sync(unsigned int control, unsigned int seq_num) {
+    auto header = (packet_header *)buffer;
+    header->control = control;
+    header->length = sizeof(packet_header);
+    header->checksum = 0;
+    header->seq_num = seq_num;
+    header->checksum = gen_checksum(buffer, header->length);
+    to_network_format(header);
+    sendto(sock, buffer, sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *)&sin, sizeof(sin));
+    cout << "[send sync] " << header->control << ' ' << seq_num << endl;
+}
+
+int try_recv_sync() {
+    int num_recv = recvfrom(sock, buffer, BUFFER_SIZE, MSG_DONTWAIT, (struct sockaddr *)&sin, &sin_len);
+    if (num_recv <= 0 || !sanity_check(buffer, num_recv))
+        return -1;
+    auto header = (packet_header *)buffer;
+    if (header->control & CONTROL_SYNC) {
+        cout << "[recv sync] " << header->control << ' ' << header->seq_num << endl;
+        return header->seq_num;
+    }
+    return -1;
+}
+
 void *my_clock(void *arg) {
-    while (1) {
+    while (1 && !should_close) {
         //sleep for 100 microseconds, can be modified
         usleep(CLOCK_TICK_MICROS);
         pthread_mutex_lock(&mutex);
         update_retrans_cd();
-        pthread_mutex_unlock(&mutex);
-        if (window.empty()) {
-            break;
-        }
-    }
-    while (1 && !should_close) {
-        usleep(CLOCK_TICK_MICROS);
-        pthread_mutex_lock(&mutex);
-        fin_cd--;
         pthread_mutex_unlock(&mutex);
     }
     return nullptr;
@@ -274,8 +299,16 @@ void *my_clock(void *arg) {
 
 void *my_send(void *arg) {
     //subdir and filename
-    srand(time(NULL));
-    last_seq_num = rand() % SEQ_MAX;
+    while (1) {
+        if (sync_cd <= 0) {
+            try_send_sync(CONTROL_SYNC, 0);
+            sync_cd = SYNC_RETRANS_CD;
+        }
+        if ((last_seq_num = try_recv_sync()) != -1)
+            break;
+    }
+
+    last_seq_num = (last_seq_num + 1) % SEQ_MAX;
     window = {make_shared<win_entry>(last_seq_num, ((string *)arg)[0].c_str(), CONTROL_FILEPATH)};
     while (1) {
         try_receive();
@@ -335,7 +368,7 @@ int main(int argc, char **argv) {
             subdir = tmp.substr(0, p);
             filename = tmp.substr(p + 1, tmp.length() - p);
             filepath = tmp;
-            
+
         } else {
             fprintf(stderr, "unknown option!\n");
             return -1;
