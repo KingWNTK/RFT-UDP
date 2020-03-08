@@ -1,18 +1,18 @@
+#include <arpa/inet.h>
+#include <deque>
+#include <fcntl.h>
+#include <iostream>
+#include <memory>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <sys/types.h>
-#include <netdb.h>
-#include <deque>
-#include <pthread.h>
 #include <string>
-#include <iostream>
-#include <memory>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include "protocol.h"
 
@@ -53,6 +53,46 @@ struct file_holder {
     int tot_bytes;
     int fd;
 
+    bool init_file_holder(string path) {
+        fd = open(path.c_str(), O_RDONLY | O_FSYNC);
+        if (fd == -1) {
+            return false;
+        }
+        tot_bytes = lseek(fd, 0, SEEK_END);
+        if (tot_bytes == -1) {
+            return false;
+        }
+        if (lseek(fd, 0, SEEK_SET)) {
+            return false;
+        }
+        tot_bytes_sent = buffer_sent = buffer_size = buffer_sent = 0;
+        memset(buf, 0, sizeof(buf));
+        return true;
+    }
+
+    bool refill_file_buf() {
+        if (tot_bytes_sent == tot_bytes) {
+            return false;
+        }
+        buffer_size = min(BATCH_SIZE, tot_bytes - tot_bytes_sent);
+        lseek(fd, tot_bytes_sent, SEEK_SET);
+        read(fd, buf, buffer_size);
+        buffer_sent = 0;
+        return true;
+    }
+
+    bool get_file_data(win_entry_ptr info) {
+        if (buffer_sent == buffer_size) {
+            if (!refill_file_buf())
+                return false;
+        }
+        info->dsize = min(info->dsize, buffer_size - buffer_sent);
+        info->data = (char *)malloc(info->dsize);
+        memcpy(info->data, buf + buffer_sent, info->dsize);
+        tot_bytes_sent += info->dsize;
+        buffer_sent += info->dsize;
+        return true;
+    }
     ~file_holder() {
         close(fd);
     }
@@ -60,7 +100,6 @@ struct file_holder {
 
 file_holder file;
 
-#define SEQ_MAX 128
 deque<win_entry_ptr> window;
 int window_size = 32;
 
@@ -79,77 +118,52 @@ struct sockaddr_in sin;
 
 socklen_t sin_len;
 
-bool done = false;
+bool should_close = false;
 
+int fin_cd = 0;
 
-bool init_file_holder(string path) {
-    file.fd = open(path.c_str(), O_RDONLY | O_FSYNC);
-    if (file.fd == -1) {
-        return false;
-    }
-    file.tot_bytes = lseek(file.fd, 0, SEEK_END);
-    if (file.tot_bytes == -1) {
-        return false;
-    }
-    if (lseek(file.fd, 0, SEEK_SET)) {
-        return false;
-    }
-    file.tot_bytes_sent = file.buffer_sent = file.buffer_size = file.buffer_sent = 0;
-    memset(file.buf, 0, sizeof(file.buf));
-    return true;
-}
-
-bool refill_file_buf() {
-    if (file.tot_bytes_sent == file.tot_bytes) {
-        return false;
-    }
-    file.buffer_size = min(BATCH_SIZE, file.tot_bytes - file.tot_bytes_sent);
-    //read min(BATCH_SIZE, tot_bytes - tot_bytes-snet) bytes starting from tot_bytes_sent from the fd
-    lseek(file.fd, file.tot_bytes_sent, SEEK_SET);
-    read(file.fd, file.buf, file.buffer_size);
-    file.buffer_sent = 0;
-    return true;
-}
-
-bool get_file_data(win_entry_ptr info) {
-    cout << "trying to get file data" << endl;
-
-    cout << file.buffer_sent << ' ' << file.buffer_size << endl;
-    if (file.buffer_sent == file.buffer_size) {
-        if (!refill_file_buf())
-            return false;
-    }
-    pthread_mutex_lock(&mutex);
-    info->dsize = min(info->dsize, file.buffer_size - file.buffer_sent);
-    info->data = (char *) malloc(info->dsize);
-    memcpy(info->data, file.buf + file.buffer_sent, info->dsize);
-    file.tot_bytes_sent += info->dsize;
-    file.buffer_sent += info->dsize;
-    pthread_mutex_unlock(&mutex);
-    cout << "get file data done" << endl;
- 
-    return true;
+inline int dis(int a, int b) {
+    return (b - a + SEQ_MAX) % SEQ_MAX;
 }
 
 bool recv_data(int len) {
-    cout << "data received: " << len << " bytes" << endl;
-
-    if (!sanity_check(buffer, len))
+    if (!sanity_check(buffer, len)) {
+        cout << "[recv corrupt packet]" << endl;
         return false;
+    }
 
-    auto header = (packet_header *) buffer;
+    if (window.empty()) {
+        return true;
+    }
 
-    if (header->seq_num >= window.front()->seq_num && header->seq_num <= window.back()->seq_num) {
-        int sz = (header->seq_num - window.front()->seq_num + 1 + SEQ_MAX) % SEQ_MAX;
+    auto header = (packet_header *)buffer;
+    cout << "[recv data] (" << header->length << " bytes) control: " << header->control
+         << " seq_num: " << header->seq_num << endl;
+    // int sz = 0;
+    // bool ok = false;
+    // for(auto e : window) {
+    //     sz++;
+    //     if(e->seq_num == header->seq_num) {
+    //         ok = true;
+    //         break;
+    //     }
+    // }
+    if ((window.front()->seq_num <= header->seq_num && dis(window.front()->seq_num, header->seq_num) < window.size()) || (window.back()->seq_num >= header->seq_num && dis(header->seq_num, window.back()->seq_num) < window.size())) {
+        int sz = window.front()->seq_num <= header->seq_num ? dis(window.front()->seq_num, header->seq_num) + 1 : window.size() - dis(header->seq_num, window.back()->seq_num);
+    // if(ok) {   
         int last_seq_num = window.back()->seq_num;
         if (header->control & CONTROL_META_DATA) {
             if (header->seq_num == 1) {
                 //if the filename and directory is received, init the window to send file buf
                 window = deque<win_entry_ptr>{};
                 for (int i = 1; i <= window_size; i++) {
-                    window.emplace_back(make_shared<win_entry>((last_seq_num + i) % SEQ_MAX, nullptr, packet_dsize_max, 0));
+                    auto e = make_shared<win_entry>((last_seq_num + i) % SEQ_MAX, nullptr, packet_dsize_max, 0);
+                    if (file.get_file_data(e)) {
+                        window.push_back(e);
+                    } else {
+                        break;
+                    }
                 }
-
             }
         } else {
             //sz packets are received, try to fill the window with sz more packets
@@ -157,47 +171,35 @@ bool recv_data(int len) {
                 window.pop_front();
             }
 
-            while (window.size() < window_size) {
-                window.emplace_back(make_shared<win_entry>((last_seq_num + 1) % SEQ_MAX, nullptr, packet_dsize_max, 0));
+            while (window.size() <= window_size) {
+                last_seq_num = (last_seq_num + 1) % SEQ_MAX;
+                auto e = make_shared<win_entry>(last_seq_num, nullptr, packet_dsize_max, 0);
+                if (file.get_file_data(e)) {
+                    window.push_back(e);
+                } else {
+                    break;
+                }
             }
         }
     }
-
-    // if(header->seq_num == 18) {
-    //     done = true;
-    // }
 
     return true;
 }
 
 bool send_data(win_entry_ptr info) {
-    cout << "trying to send data" << endl;
-
-    /** 
-     * fill the buffer
-     */
-    if (!info->data) {
-        if (!get_file_data(info)) {
-            //the whole file is sent
-            return false;
-        }
-    }
-    cout << info->dsize << endl;
-    auto header = (packet_header *) buffer;
+    auto header = (packet_header *)buffer;
     header->seq_num = info->seq_num;
     header->control = info->control;
     header->checksum = 0;
     header->length = sizeof(packet_header) + info->dsize;
     memcpy(buffer + sizeof(packet_header), info->data, info->dsize);
-    cout << "ready" << endl;
     header->checksum = gen_checksum(buffer, header->length);
 
     to_network_format(header);
 
-    sendto(sock, buffer, info->dsize + sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *) &sin, sizeof(sin));
-
-    cout << "data sent, seq num: " << info->seq_num << ", times sent: " << info->times_sent << endl;
-
+    sendto(sock, buffer, info->dsize + sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *)&sin, sizeof(sin));
+    cout << "[send data] (" << info->dsize + sizeof(packet_header) << " bytes) seq num:"
+         << info->seq_num << ", times sent: " << info->times_sent << endl;
     pthread_mutex_lock(&mutex);
     info->retrans_cd = retrans_cd_max;
     info->times_sent++;
@@ -213,12 +215,9 @@ void update_retrans_cd() {
 
 void try_receive() {
     int num_recv = 0;
-    if ((num_recv = recvfrom(sock, buffer, BUFFER_SIZE, MSG_DONTWAIT, (struct sockaddr *) &sin, &sin_len)) > 0) {
-        cout << "received" << endl;
+    if ((num_recv = recvfrom(sock, buffer, BUFFER_SIZE, MSG_DONTWAIT, (struct sockaddr *)&sin, &sin_len)) > 0) {
         pthread_mutex_lock(&mutex);
-        if(recv_data(num_recv)) {
-            
-        }
+        recv_data(num_recv);
         pthread_mutex_unlock(&mutex);
     }
 }
@@ -226,34 +225,95 @@ void try_receive() {
 void try_send() {
     for (auto e : window) {
         if (e->retrans_cd <= 0) {
-            if(!send_data(e)) {
-                // done = true;
+            send_data(e);
+            if(e->times_sent > 50) {
+                cout << "window size " << window.size() << endl;
             }
             break;
         }
     }
 }
 
+int try_recv_fin() {
+    int num_recv = recvfrom(sock, buffer, BUFFER_SIZE, MSG_DONTWAIT, (struct sockaddr *)&sin, &sin_len);
+    if (num_recv <= 0 || !sanity_check(buffer, num_recv))
+        return 0;
+    auto header = (packet_header *)buffer;
+    cout << "[recv fin] " << header->control << endl;
+    if (header->control & CONTROL_FIN_ACK)
+        return CONTROL_FIN_ACK;
+    else if (header->control & CONTROL_FIN)
+        return CONTROL_FIN;
+    return 0;
+}
+
+void try_send_fin(unsigned int control) {
+    auto header = (packet_header *)buffer;
+    header->control = control;
+    header->length = sizeof(packet_header);
+    header->checksum = 0;
+    header->seq_num = 0;
+    header->checksum = gen_checksum(buffer, header->length);
+    to_network_format(header);
+    sendto(sock, buffer, sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *)&sin, sizeof(sin));
+    cout << "[send fin] " << header->control << endl;
+}
+
 void *my_clock(void *arg) {
-    while (1 && !done) {
+    while (1) {
         //sleep for 100 microseconds, can be modified
-        usleep(100);
+        usleep(CLOCK_TICK_MICROS);
         pthread_mutex_lock(&mutex);
         update_retrans_cd();
+        pthread_mutex_unlock(&mutex);
+        if (window.empty()) {
+            break;
+        }
+    }
+    while (1 && !should_close) {
+        usleep(CLOCK_TICK_MICROS);
+        pthread_mutex_lock(&mutex);
+        fin_cd--;
         pthread_mutex_unlock(&mutex);
     }
     return nullptr;
 }
 
 void *my_send(void *arg) {
-             //path
+    //subdir and filename
     window = {make_shared<win_entry>(0, ((string *)arg)[0].c_str(), CONTROL_META_DATA),
-              //filename
-              make_shared<win_entry>(1, ((string *) arg)[1].c_str(), CONTROL_META_DATA)};
-
-    while (1 && !done) {
+              make_shared<win_entry>(1, ((string *)arg)[1].c_str(), CONTROL_META_DATA)};
+    while (1) {
         try_receive();
         try_send();
+        if (window.empty()) {
+            break;
+        }
+    }
+    while (1) {
+        pthread_mutex_lock(&mutex);
+        if (fin_cd <= 0) {
+            fin_cd = FIN_RETRANS_CD;
+            try_send_fin(CONTROL_FIN);
+        }
+        pthread_mutex_unlock(&mutex);
+        if (try_recv_fin()) {
+            break;
+        }
+    }
+    fin_cd = 10 * FIN_RETRANS_CD;
+    while (1) {
+        pthread_mutex_lock(&mutex);
+        if (try_recv_fin()) {
+            fin_cd = 10 * FIN_RETRANS_CD;
+            try_send_fin(CONTROL_FIN_ACK);
+        }
+        pthread_mutex_unlock(&mutex);
+
+        if (fin_cd <= 0) {
+            should_close = true;
+            break;
+        }
     }
     return nullptr;
 }
@@ -261,28 +321,26 @@ void *my_send(void *arg) {
 int main(int argc, char **argv) {
     string recv_host, recv_port, subdir, filename;
 
-    if(argc < 4) {
+    if (argc < 4) {
         fprintf(stderr, "too few arguments!\n");
         return -1;
     }
 
-    for(int i = 1; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {
         string cmd = string(argv[i]);
-        if(cmd == "-r") {
+        if (cmd == "-r") {
             i++;
             string tmp = string(argv[i]);
             int p = tmp.find(':');
             recv_host = tmp.substr(0, p);
             recv_port = tmp.substr(p + 1, tmp.length() - p);
-        }
-        else if(cmd == "-f") {
+        } else if (cmd == "-f") {
             i++;
             string tmp = string(argv[i]);
             int p = tmp.find('/');
             subdir = tmp.substr(0, p);
             filename = tmp.substr(p + 1, tmp.length() - p);
-        }
-        else {
+        } else {
             fprintf(stderr, "unknown option!\n");
             return -1;
         }
@@ -291,11 +349,11 @@ int main(int argc, char **argv) {
     /**
      * init the file holder
      */
-    if (!init_file_holder(subdir + '/' + filename)) {
+    if (!file.init_file_holder(subdir + '/' + filename)) {
         fprintf(stderr, "failed to open file");
         return -1;
     }
-    refill_file_buf();
+    file.refill_file_buf();
 
     /* variables for identifying the receiver */
     unsigned int receiver_addr;
@@ -306,7 +364,7 @@ int main(int argc, char **argv) {
     hints.ai_family = AF_INET; /* indicates we want IPv4 */
 
     if (getaddrinfo(recv_host.c_str(), nullptr, &hints, &getaddrinfo_result) == 0) {
-        receiver_addr = (unsigned int) ((struct sockaddr_in *) (getaddrinfo_result->ai_addr))->sin_addr.s_addr;
+        receiver_addr = (unsigned int)((struct sockaddr_in *)(getaddrinfo_result->ai_addr))->sin_addr.s_addr;
         freeaddrinfo(getaddrinfo_result);
     } else {
         return -1;
@@ -322,7 +380,6 @@ int main(int argc, char **argv) {
     sin.sin_addr.s_addr = receiver_addr;
     unsigned short server_port = atoi(recv_port.c_str());
     sin.sin_port = htons(server_port);
-
 
     if (pthread_mutex_init(&mutex, nullptr) != 0) {
         fprintf(stderr, "init mutex failed\n");

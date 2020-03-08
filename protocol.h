@@ -5,7 +5,14 @@
 using namespace std;
 
 #define CONTROL_META_DATA 1
+#define CONTROL_FIN 2
+#define CONTROL_FIN_ACK 4
 
+
+#define FIN_RETRANS_CD 5
+#define CLOCK_TICK_MICROS 100
+
+#define SEQ_MAX 255
 
 struct packet_header {
     unsigned int seq_num : 8;
