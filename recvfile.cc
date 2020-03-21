@@ -1,4 +1,6 @@
 #include <arpa/inet.h>
+#include <cstdlib>
+#include <ctime>
 #include <deque>
 #include <fcntl.h>
 #include <iostream>
@@ -14,8 +16,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <ctime>
-#include <cstdlib>
 
 #include "protocol.h"
 
@@ -24,9 +24,10 @@ using namespace std;
 struct win_entry {
     int seq_num;
     char *data;
+    int start;
     int dsize;
     int control;
-    win_entry(int seq_num_in) : seq_num(seq_num_in), data(nullptr), dsize(0), control(0) {}
+    win_entry(int seq_num_in) : seq_num(seq_num_in), data(nullptr), dsize(0), control(0), start(0) {}
     bool is_empty() {
         return (!data);
     }
@@ -126,12 +127,13 @@ bool send_data(unsigned int ack, unsigned int control) {
     header->seq_num = ack;
     header->length = sizeof(packet_header);
     header->control = control;
+    header->start = 0;
     header->checksum = 0;
     header->checksum = gen_checksum(header, header->length);
     to_network_format(header);
 
     sendto(sock, buffer, sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *)&sender_addr, sender_addr_len);
-    cout << "[send data] ack: " << ack << " control: " << control << endl;
+    // cout << "[send data] ack: " << ack << " control: " << control << endl;
 }
 
 int recv_data(int len) {
@@ -141,9 +143,9 @@ int recv_data(int len) {
     }
 
     auto header = (packet_header *)buffer;
-    cout << "[recv data] (" << header->length << " bytes) control: " << header->control
-         << " seq_num: " << header->seq_num << endl;
-    if((header->control & CONTROL_SYNC) && !has_synced) {
+    // cout << "[recv data] " << header->start << " (" << header->length << " bytes) control: " << header->control
+    //      << " seq_num: " << header->seq_num;
+    if ((header->control & CONTROL_SYNC) && !has_synced) {
         return CONTROL_SYNC;
     }
 
@@ -151,8 +153,10 @@ int recv_data(int len) {
         return CONTROL_FIN;
     }
 
+    cout << "[recv data] " << header->start << " (" << header->length << ") ";
+
+
     if (!has_synced && (header->control & CONTROL_FILEPATH) && header->seq_num == (sync_seq_num + 1) % SEQ_MAX) {
-        cout << "enter init section" << endl;
         string filepath = string(buffer + sizeof(packet_header), header->length - sizeof(packet_header));
         int p = filepath.find('/');
         file.subdir = filepath.substr(0, p);
@@ -169,30 +173,42 @@ int recv_data(int len) {
         }
         has_synced = true;
     } else if (!window.empty() && is_seq_in_window(header->seq_num, window.front()->seq_num, window.back()->seq_num, window.size())) {
+        bool new_data = false;
         for (auto e : window) {
             if (e->seq_num == header->seq_num) {
                 //save the data if we hasn't received this packet before
                 if (e->is_empty()) {
+                    new_data = true;
                     e->set_data(buffer + sizeof(packet_header), header->length - sizeof(packet_header), header->control);
                 }
                 break;
             }
         }
-        if (!window.front()->is_empty()) {
-            //we can now move the sliding window.
-            int sz = 0;
-            int base = window.back()->seq_num;
-            while (!window.empty() && !window.front()->is_empty()) {
-                sz++;
-                file.write_file_data(window.front());
-                last_ack = window.front()->seq_num;
-                last_control = window.front()->control;
-                window.pop_front();
-            }
-            for (int i = 1; i <= sz; i++) {
-                window.emplace_back(make_shared<win_entry>((base + i) % SEQ_MAX));
+        if (!new_data) {
+            cout << "IGNORED" << endl;
+        } else {
+            if (!window.front()->is_empty()) {
+                //we can now move the sliding window.
+                cout << "ACCEPTED(in-order)" << endl;
+                int sz = 0;
+                int base = window.back()->seq_num;
+                while (!window.empty() && !window.front()->is_empty()) {
+                    sz++;
+                    file.write_file_data(window.front());
+                    last_ack = window.front()->seq_num;
+                    last_control = window.front()->control;
+                    window.pop_front();
+                }
+                for (int i = 1; i <= sz; i++) {
+                    window.emplace_back(make_shared<win_entry>((base + i) % SEQ_MAX));
+                }
+            } else {
+                cout << "ACCEPTED(out-of-order)" << endl;
             }
         }
+
+    } else {
+        cout << "IGNORED" << endl;
     }
     if (has_synced)
         send_data(last_ack, last_control);
@@ -218,7 +234,7 @@ int try_recv_fin() {
     if (header->seq_num != last_ack)
         return 0;
 
-    cout << "[recv fin] " << header->control << ' ' << header->seq_num << endl;
+    // cout << "[recv fin] " << header->control << ' ' << header->seq_num << endl;
 
     if (header->control & CONTROL_FIN)
         return CONTROL_FIN;
@@ -232,11 +248,12 @@ void try_send_fin(unsigned int control, unsigned int seq_num) {
     header->control = control;
     header->length = sizeof(packet_header);
     header->checksum = 0;
+    header->start = 0;
     header->seq_num = seq_num;
     header->checksum = gen_checksum(buffer, header->length);
     to_network_format(header);
     sendto(sock, buffer, sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *)&sender_addr, sizeof(sender_addr));
-    cout << "[send fin] " << header->control << ' ' << seq_num << endl;
+    // cout << "[send fin] " << header->control << ' ' << seq_num << endl;
 }
 
 void try_send_sync(unsigned int control, unsigned int seq_num) {
@@ -244,17 +261,18 @@ void try_send_sync(unsigned int control, unsigned int seq_num) {
     header->control = control;
     header->length = sizeof(packet_header);
     header->checksum = 0;
+    header->start = 0;
     header->seq_num = seq_num;
     header->checksum = gen_checksum(buffer, header->length);
     to_network_format(header);
     sendto(sock, buffer, sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *)&sender_addr, sizeof(sender_addr));
-    cout << "[send sync] " << header->control << ' ' << seq_num << endl;
+    // cout << "[send sync] " << header->control << ' ' << seq_num << endl;
 }
 
 int try_recv_sync() {
     int num_recv = 0;
-    if((num_recv = recvfrom(sock, buffer, BUFFER_SIZE, MSG_DONTWAIT, (struct sockaddr *)&sender_addr, &sender_addr_len)) > 0) {
-        if(recv_data(num_recv) == CONTROL_SYNC) {
+    if ((num_recv = recvfrom(sock, buffer, BUFFER_SIZE, MSG_DONTWAIT, (struct sockaddr *)&sender_addr, &sender_addr_len)) > 0) {
+        if (recv_data(num_recv) == CONTROL_SYNC) {
             return CONTROL_SYNC;
         }
     }
@@ -262,24 +280,26 @@ int try_recv_sync() {
 }
 
 void *my_sync_clock(void *arg) {
-     while (1 && !has_synced) {
+    while (1 && !has_synced) {
         usleep(CLOCK_TICK_MICROS);
         pthread_mutex_lock(&mutex);
-        if(sync_cd) sync_cd--;
+        if (sync_cd)
+            sync_cd--;
         pthread_mutex_unlock(&mutex);
     }
     return nullptr;
 }
 
 void *my_sync(void *arg) {
-    while(1) {
-        if(try_recv_sync()) break;
+    while (1) {
+        if (try_recv_sync())
+            break;
     }
     srand(time(NULL));
     sync_seq_num = rand() % SEQ_MAX;
-    while(1 && !has_synced) {
+    while (1 && !has_synced) {
         pthread_mutex_lock(&mutex);
-        if(sync_cd <= 0) {
+        if (sync_cd <= 0) {
             try_send_sync(CONTROL_SYNC, sync_seq_num);
             sync_cd = SYNC_RETRANS_CD;
         }
@@ -293,7 +313,8 @@ void *my_fin_clock(void *arg) {
     while (1 && !should_close) {
         usleep(CLOCK_TICK_MICROS);
         pthread_mutex_lock(&mutex);
-        if(fin_cd) fin_cd--;
+        if (fin_cd)
+            fin_cd--;
         pthread_mutex_unlock(&mutex);
     }
     return nullptr;
@@ -313,6 +334,7 @@ void *my_fin(void *arg) {
             break;
         }
     }
+    cout << "[completed]" << endl;
 }
 
 int main(int argc, char **argv) {

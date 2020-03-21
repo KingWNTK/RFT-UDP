@@ -27,6 +27,8 @@ struct packet_header {
     unsigned int control : 8;
     unsigned int length : 16;
     unsigned int checksum: 16;
+    unsigned int start;
+
 };
 
 void print_header(packet_header *header) {
@@ -36,12 +38,14 @@ void print_header(packet_header *header) {
 
 void to_network_format(packet_header *header) {
     header->seq_num = (unsigned int)htons(header->seq_num);
+    header->start = (unsigned int)htonl(header->start);
     header->length = (unsigned int)htons(header->length);
     header->checksum = (unsigned int)htons(header->checksum);
 }
 
 void to_host_format(packet_header *header) {
     header->seq_num = (unsigned int)ntohs(header->seq_num);
+    header->start = (unsigned int)ntohl(header->start);
     header->length = (unsigned int)ntohs(header->length);
     header->checksum = (unsigned int)ntohs(header->checksum);
 }
@@ -77,6 +81,7 @@ bool verify_checksum(unsigned int checksum, void *data, unsigned int dsize) {
 bool sanity_check(void *packet, unsigned int packet_len) {
     auto header = (packet_header *)packet;
     to_host_format(header);
+    // cout << header->start << endl;
     return verify_checksum(header->checksum, packet, packet_len);
 }
 

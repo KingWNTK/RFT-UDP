@@ -5,18 +5,18 @@ CFLAGS	 	= -Wall -std=c++11 -g -pthread
 LDFLAGS	 	= 
 DEFS 	 	=
 
-all: sender receiver
+all: recvfile sendfile
 
-sender: sender.cc
-	$(CC) $(DEFS) $(CFLAGS) $(LIB) -o sender sender.cc
+sendfile: sendfile.cc
+	$(CC) $(DEFS) $(CFLAGS) $(LIB) -o sendfile sendfile.cc
 
-receiver: receiver.cc
-	$(CC) $(DEFS) $(CFLAGS) $(LIB) -o receiver receiver.cc
+recvfile: recvfile.cc
+	$(CC) $(DEFS) $(CFLAGS) $(LIB) -o recvfile recvfile.cc
 
 clean:
 	rm -f *.o
 	rm -f *~
 	rm -f core.*.*
-	rm -f sender
-	rm -f receiver
+	rm -f sendfile
+	rm -f recvfile
 	

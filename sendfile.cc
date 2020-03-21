@@ -1,4 +1,6 @@
 #include <arpa/inet.h>
+#include <cstdlib>
+#include <ctime>
 #include <deque>
 #include <fcntl.h>
 #include <iostream>
@@ -13,8 +15,6 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <ctime>
-#include <cstdlib>
 
 #include "protocol.h"
 
@@ -25,6 +25,7 @@ struct win_entry {
     int retrans_cd;
     int times_sent;
     char *data;
+    int start;
     int dsize;
     int control;
     win_entry(int seq_num_in, const char *data_in, int control_in) : seq_num(seq_num_in), control(control_in) {
@@ -32,9 +33,11 @@ struct win_entry {
         retrans_cd = times_sent = 0;
         data = (char *)malloc(dsize);
         memcpy(data, data_in, dsize);
+        start = 0;
     }
     win_entry(int seq_num_in, char *data_in, int dsize_in, int control_in) : seq_num(seq_num_in), data(data_in), dsize(dsize_in), control(control_in) {
         retrans_cd = times_sent = 0;
+        start = 0;
     }
     ~win_entry() {
         if (data) {
@@ -91,6 +94,7 @@ struct file_holder {
         info->dsize = min(info->dsize, buffer_size - buffer_sent);
         info->data = (char *)malloc(info->dsize);
         memcpy(info->data, buf + buffer_sent, info->dsize);
+        info->start = tot_bytes_sent;
         tot_bytes_sent += info->dsize;
         buffer_sent += info->dsize;
         return true;
@@ -134,7 +138,7 @@ int dis(int a, int b) {
 
 bool recv_data(int len) {
     if (!sanity_check(buffer, len)) {
-        cout << "[recv corrupt packet]" << endl;
+        // cout << "[recv corrupt packet]" << endl;
         return false;
     }
 
@@ -143,11 +147,10 @@ bool recv_data(int len) {
     }
 
     auto header = (packet_header *)buffer;
-    cout << "[recv data] (" << header->length << " bytes) control: " << header->control
-         << " seq_num: " << header->seq_num << endl;
+    // cout << "[recv data] (" << header->length << " bytes) control: " << header->control
+    //      << " seq_num: " << header->seq_num << endl;
 
     if (is_seq_in_window(header->seq_num, window.front()->seq_num, window.back()->seq_num, window.size())) {
-        // if(((window.front()->seq_num <= header->seq_num && dis(window.front()->seq_num, header->seq_num) < window.size()) || (window.back()->seq_num >= header->seq_num && dis(header->seq_num, window.back()->seq_num) < window.size()))) {
         int sz = window.front()->seq_num <= header->seq_num ? dis(window.front()->seq_num, header->seq_num) + 1 : window.size() - dis(header->seq_num, window.back()->seq_num);
         if (header->control & CONTROL_FILEPATH) {
             //if the filename and directory is received, init the window
@@ -188,6 +191,7 @@ bool send_data(win_entry_ptr info) {
     auto header = (packet_header *)buffer;
     header->seq_num = info->seq_num;
     header->control = info->control;
+    header->start = info->start;
     header->checksum = 0;
     header->length = sizeof(packet_header) + info->dsize;
     memcpy(buffer + sizeof(packet_header), info->data, info->dsize);
@@ -196,8 +200,9 @@ bool send_data(win_entry_ptr info) {
     to_network_format(header);
 
     sendto(sock, buffer, info->dsize + sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *)&sin, sizeof(sin));
-    cout << "[send data] (" << info->dsize + sizeof(packet_header) << " bytes) seq num:"
-         << info->seq_num << ", times sent: " << info->times_sent << endl;
+    // cout << "[send data] " << info->start << " (" << info->dsize + sizeof(packet_header) << " bytes) seq num:"
+    //      << info->seq_num << ", times sent: " << info->times_sent << endl;
+    cout << "[send data] " << info->start << " (" << info->dsize + sizeof(packet_header) << ")" << endl;
     pthread_mutex_lock(&mutex);
     info->retrans_cd = retrans_cd_max;
     info->times_sent++;
@@ -206,8 +211,10 @@ bool send_data(win_entry_ptr info) {
 }
 
 void update_retrans_cd() {
-    if(sync_cd) sync_cd--;
-    if(fin_cd) fin_cd--;
+    if (sync_cd)
+        sync_cd--;
+    if (fin_cd)
+        fin_cd--;
     for (auto e : window) {
         e->retrans_cd--;
     }
@@ -226,12 +233,22 @@ void try_send() {
     for (auto e : window) {
         if (e->retrans_cd <= 0) {
             send_data(e);
-            // if (e->times_sent > 50) {
-            //     cout << "window size " << window.size() << endl;
-            // }
             break;
         }
     }
+}
+
+void try_send_control(unsigned int control, unsigned int seq_num) {
+    auto header = (packet_header *)buffer;
+    header->control = control;
+    header->length = sizeof(packet_header);
+    header->checksum = 0;
+    header->start = 0;
+    header->seq_num = seq_num;
+    header->checksum = gen_checksum(buffer, header->length);
+    to_network_format(header);
+    sendto(sock, buffer, sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *)&sin, sizeof(sin));
+    // cout << "[send control] " << header->control << ' ' << seq_num << endl;
 }
 
 int try_recv_fin() {
@@ -241,7 +258,7 @@ int try_recv_fin() {
     auto header = (packet_header *)buffer;
     if (header->seq_num != last_seq_num)
         return 0;
-    cout << "[recv fin] " << header->control << ' ' << header->seq_num << endl;
+    // cout << "[recv fin] " << header->control << ' ' << header->seq_num << endl;
 
     if (header->control & CONTROL_FIN)
         return CONTROL_FIN;
@@ -250,37 +267,13 @@ int try_recv_fin() {
     return 0;
 }
 
-void try_send_fin(unsigned int control, unsigned int seq_num) {
-    auto header = (packet_header *)buffer;
-    header->control = control;
-    header->length = sizeof(packet_header);
-    header->checksum = 0;
-    header->seq_num = seq_num;
-    header->checksum = gen_checksum(buffer, header->length);
-    to_network_format(header);
-    sendto(sock, buffer, sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *)&sin, sizeof(sin));
-    cout << "[send fin] " << header->control << ' ' << seq_num << endl;
-}
-
-void try_send_sync(unsigned int control, unsigned int seq_num) {
-    auto header = (packet_header *)buffer;
-    header->control = control;
-    header->length = sizeof(packet_header);
-    header->checksum = 0;
-    header->seq_num = seq_num;
-    header->checksum = gen_checksum(buffer, header->length);
-    to_network_format(header);
-    sendto(sock, buffer, sizeof(packet_header), MSG_DONTWAIT, (struct sockaddr *)&sin, sizeof(sin));
-    cout << "[send sync] " << header->control << ' ' << seq_num << endl;
-}
-
 int try_recv_sync() {
     int num_recv = recvfrom(sock, buffer, BUFFER_SIZE, MSG_DONTWAIT, (struct sockaddr *)&sin, &sin_len);
     if (num_recv <= 0 || !sanity_check(buffer, num_recv))
         return -1;
     auto header = (packet_header *)buffer;
     if (header->control & CONTROL_SYNC) {
-        cout << "[recv sync] " << header->control << ' ' << header->seq_num << endl;
+        // cout << "[recv sync] " << header->control << ' ' << header->seq_num << endl;
         return header->seq_num;
     }
     return -1;
@@ -301,7 +294,7 @@ void *my_send(void *arg) {
     //subdir and filename
     while (1) {
         if (sync_cd <= 0) {
-            try_send_sync(CONTROL_SYNC, 0);
+            try_send_control(CONTROL_SYNC, 0);
             sync_cd = SYNC_RETRANS_CD;
         }
         if ((last_seq_num = try_recv_sync()) != -1)
@@ -321,7 +314,7 @@ void *my_send(void *arg) {
         pthread_mutex_lock(&mutex);
         if (fin_cd <= 0) {
             fin_cd = FIN_RETRANS_CD;
-            try_send_fin(CONTROL_FIN, last_seq_num);
+            try_send_control(CONTROL_FIN, last_seq_num);
         }
         pthread_mutex_unlock(&mutex);
         if (try_recv_fin()) {
@@ -333,7 +326,7 @@ void *my_send(void *arg) {
         pthread_mutex_lock(&mutex);
         if (try_recv_fin()) {
             fin_cd = 10 * FIN_RETRANS_CD;
-            try_send_fin(CONTROL_FIN_ACK, last_seq_num);
+            try_send_control(CONTROL_FIN_ACK, last_seq_num);
         }
         pthread_mutex_unlock(&mutex);
 
@@ -342,6 +335,7 @@ void *my_send(void *arg) {
             break;
         }
     }
+    cout << "[completed]" << endl;
     return nullptr;
 }
 
