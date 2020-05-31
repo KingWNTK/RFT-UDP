@@ -1,8 +1,4 @@
-# Project 2 for COMP 556.
-Our team members are:  
-Yifan Wang, yw90  
-Yuyu Qian, yq17  
-Weiwei Zhou, wz37  
+# Reliable file transportation on UDP
 
 # How to run
 Simply use make to make both files, and you can run the programs with the following form:
